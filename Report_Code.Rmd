@@ -1,0 +1,349 @@
+---
+title: "Prediction of Breast Cancer Diagnosis"
+author: "Eliza Chai, Ingrid Luo"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warnings=FALSE, fig.align='center', fig.pos = 'H')
+
+# load packages
+library(tidyverse)
+library(readr)
+library(glmnet)
+library(caret)
+library(ranger)
+library(car)
+library(janitor)
+library(pROC)
+library(gtsummary)
+library(kableExtra)
+library(ggplot2)
+library(reshape2)
+```
+
+## Scientific Background
+
+Breast cancer is the second most common cause of death from cancer in women in the US after lung cancer. Genetic, environmental and behavioral factors contribute to the wide variation in the clinical course of breast cancer, and the length of time that patients can expect to live. Breast cancer occurs as a result of disordered proliferation and constant growth of cells in the breast tissue, known as tumor. A tumor can be benign (not cancerous) or malignant (cancerous). Benign tumors do not invade other tissues and do not spread to other parts of the body, and can be removed surgically. In other words, these tumors are not life-threatening. Malignant tumors grow and multiply far more quickly than benign tumors. They spread systematically and invade vital organs, which deteriorate the health of patients. Whether a tumor is benign or malignant is determined by pathological examination, such as fine-needle aspiration (FNA). In this technique, a thin (23--25 gauge), hollow needle is inserted into the mass for sampling of cells that, after being stained, will be examined under a microscope (biopsy). Fine-needle aspiration biopsies are very safe minor surgical procedures.
+
+## Goal of the Study
+
+The identification and classification of breast tumor tissues is a critical step for clinicians to accurately and effectively diagnose breast cancer in patients at an early stage. The objective of the study is to use classification techniques (logistic regression model and random forest) to predict the diagnosis of breast tumor tissues as either malignant or benign for women in Wisconsin based on ten cytological features of each FNA of a breast mass.
+
+## Problem of Interest
+
+The problem of interest is choosing the most related features in predicting malignant or benign breast cancer and test the performance of the selected algorithm for breast cancer diagnosis.
+
+## Data Description
+
+The Breast Cancer (Wisconsin) Diagnosis dataset contains information of 568 women across 32 different attributes. One feature is an identification number, another is the cancer diagnosis that is coded as "M" to indicate malignant or "B" to indicate benign, and the other 30 laboratory measurements describing the characteristics of the cell nuclei in the breast tissue present in the digitized image of a fine needle aspirate (FNA) of a breast mass. These variables include mean, standard error and worst (i.e. largest) value for 10 features for each cell nucleus, which are as follows:
+
+-   radius (mean of distances from center to points on the perimeter)
+-   texture (standard deviation of gray-scale values)
+-   perimeter
+-   area
+-   smoothness (local variation in radius lengths)
+-   compactness (perimeter\^2 / area - 1.0)
+-   concavity (severity of concave portions of the contour)
+-   concave points (number of concave portions of the contour)
+-   symmetry
+-   fractal dimension ("coastline approximation" - 1)
+
+Cancer diagnosis is the qualitative response variable (M = malignant, B = benign). The above 30 features are the predictors/covariates and they are quantitative.
+
+## Data Preparation
+
+### Duplicates and missing data
+
+The dataset used is clean and does not have any duplicates or missing values.
+
+### Balance data
+
+We first check whether our response variable is balanced in the dataset. Out of 568 observations, 63% of observations were benign, and 37% of observations were malignant, which suggests that our data is slightly unbalanced.
+
+### Correlation
+
+We then check for correlations. From the correlation plot, we observe that quite a few variables are correlated. Since features with high correlation are more linearly dependent and would have similar effect on the diagnosis (response variable), we use findcorrelation() from the caret package to remove highly correlated predictors based on whose correlation is above 0.7. This function uses a heuristic algorithm to search through the correlation matrix and determine which variable should be removed that would reduce pairwise correlations.
+
+After removing the pairwise correlated variables, we have 10 covariates remaining in the dataset (21 variables were removed).
+
+```{r data_prep_1, fig.height=8, fig.cap = "Pearson's Correlation between variables. The positive correlation between two variables is demonstrated through the darkness of blue color. Similarly, negative correlation between two variables is demonstrated throuhg the darkness of orange color", warning=FALSE}
+########### 
+## Read in datasets
+########### 
+setwd("~/Downloads")
+data <- read_csv("data.csv")
+
+########### 
+## Tidy the data
+########### 
+# remove NULL data
+data <- data[, -33]
+# check for missing values
+tmp <- which(complete.cases(data)==FALSE) # no missing data
+
+
+########### 
+## Transform the data
+########### 
+data$diagnosis <- factor(data$diagnosis, levels=c("B","M"), labels=c(0, 1))
+
+########### 
+## Remove correlated variables
+########### 
+# check how balanced is our response variable
+tab_diagnosis <- round(prop.table(table(data$diagnosis)), 2) # slightly unbalanced
+# check for correlations and remove multicollinearity
+data_corr <- cor(data %>% select(-c(id, diagnosis)))
+corrplot::corrplot(data_corr, tl.col="black", order = "hclust", tl.cex = 1, addrect = 8, insig = "label_sig") # quite a few variables are correlated
+# findcorrelation() from caret package remove highly correlated predictors based on whose correlation is above 0.7. 
+# This function uses a heuristic algorithm to determine which variable should be removed
+data2 <- data %>% select(-findCorrelation(data_corr, cutoff = 0.7))
+# number of columns for our new data frame
+tmp2 <- head(data2) # 21 variables shorter
+```
+
+\pagebreak
+
+### Multicollinearity
+
+Multicollinearity occurs when there is a correlation between 2 or more independent variables in the regression model which would affect the classification accuracy. We examine multicollinearity within the dataset to remove variables that are multicollinear. We fit a logistic regression model with all 10 variables and examine the variance inflation factor (VIF), which is a measure of the amount of multicollinearity in regression analysis. From the result, we observe that the variable 'concavity_worst' has the highest VIF (vif = 13.23).
+
+```{r data_prep_2, warning=FALSE}
+# drop variables with high VIF (vif > 10 indicates multi-collinearity)
+fit_logistic <- glm(diagnosis ~ ., family = binomial,  data = data2)
+fit_logistic_summary <- summary(fit_logistic)
+sort(vif(fit_logistic))
+```
+
+Therefore, we drop the variable 'concavity_worst', which has the high VIF (vif \>10 indicates multicollinearity). We then refit the logistic regression model with 9 variables and confirm all variables have VIF less than 10 from the regression model output.
+
+```{r data_prep_3, warning=FALSE}
+# remove 'concavity_worst', which has the highest VIF
+data2 <- data2 %>% select(-concavity_worst)
+fit_logistic_2 <- glm(diagnosis ~ ., family = binomial,  data = data2)
+summary(fit_logistic_2)
+sort(vif(fit_logistic_2)) # now all variables have VIF less than 10
+```
+
+### Outliers
+
+We use boxplot to present of the distribution of the remaining features separated by benign and malignant classes. Almost all the features have outliers, and we decide to keep them in order to have as much data as possible.
+
+```{r boxplot, fig.cap = "Boxplot for 9 features, stratified by benign and malignant classes."}
+df.m <- melt(data2, id.var = "diagnosis")
+ggplot(df.m, aes(x = variable, y = value)) + 
+  geom_boxplot(aes(fill = diagnosis)) + 
+  facet_wrap(~variable, scales = "free") + 
+  ylab("") + guides(fill = guide_legend(title = "Group"))
+
+```
+
+### Descriptive Statistics
+
+In general, malignant diagnoses have higher measurements.
+
+```{r descrip}
+descrip <- 
+  data2 %>%
+  mutate(diagnosis = case_when(diagnosis == 0 ~ "Benign",
+                               diagnosis == 1 ~ "Malignant")) %>%
+  tbl_summary(by = diagnosis, 
+              statistic = all_continuous() ~ "{median} ({p25}, {p75})", 
+              digits = all_continuous()  ~ c(2, 2)) %>% 
+  modify_header(list(
+    stat_1 ~ "Benign, N = {n}",
+    stat_2 ~ "Malignant, N = {n}"
+  )) %>%
+  as_tibble()
+colnames(descrip)[1] <- "Feature"
+
+kable(descrip,
+      caption="Distribution of the selected features, stratified by two groups of diagnosis. Most of the features are right skewed, and are summarized as median (IQR).") %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+### Test-Train split
+
+We randomly assign 80% of the observations in the dataset to a training set, and the remaining 20% of the observations to a test set to prevent overfitting and to accurately evaluate the model.
+
+```{r test_train_split}
+########### 
+## Test-train split (80% vs 20%)
+########### 
+set.seed(101)
+sampling_index <- createDataPartition(data2$diagnosis, times = 1, p = 0.8, list = FALSE)
+training_logreg <- data2[sampling_index, ]
+testing_logreg <-  data2[-sampling_index, ]
+```
+
+### Turn dataset into numeric
+
+We create a separate dataset by converting the original dataset into numeric to prepare for random forest classification.
+
+## Modeling
+
+### Logistic regression
+
+We fit a logistic regression model with diagnosis as the outcome and the main effect of 9 features for each cell nucleus. We used model-based standard error estimates to construct confidence intervals and for hypothesis testing to assess significant predictors (Wald test).
+
+### Logistic regression plus stepwise forward selection with AIC
+
+We implement the stepwise forward selection algorithm to select the best subset model based on AIC. The stepwise regression model begins with a model only with intercept and adds in variables one by one. This algorithm is beneficial in reducing training times and the chances of overfitting. It also helps us simplify the model which makes it more interpretable. We used model-based standard error estimates to construct confidence intervals and for hypothesis testing to assess significant predictors (Wald test).
+
+### Random forest classification
+
+We use random forests or random decision forest for classification. The random forest is a classification algorithm that consists of many decision trees to create an uncorrelated forest of trees and returns the class selected by most trees as the output.
+
+## Results (Interpret findings from fitted model):
+
+### Logistic Regression
+
+Based on the fitted logistic regression model, the variables 'texture_mean', 'perimeter_worst', and 'concave_point_worst' are the significant predictors (Wald test p=0.00006, p=0.0020, p=0.0007 respectively). With the logistic regression model, the misclassification error rate on the test set is 1.77%. The prediction accuracy of the logistic regression model on the test set is 98.23%.
+
+```{r logit, warning=FALSE}
+########### 
+## Fit logistic regression
+########### 
+model_logistic_train <- glm(diagnosis ~., 
+                            family = binomial, data=training_logreg)
+summary(model_logistic_train)
+# obtaining test error
+obs_test_logreg=testing_logreg[,1]
+pred.prob_test_logreg=predict(model_logistic_train, newdata=testing_logreg[,-1], type="response")
+pred.class_test_logreg=ifelse(pred.prob_test_logreg > 0.5, 1, 0)
+confusionMatrix(data=as.factor(pred.class_test_logreg),
+                reference=unlist(as.list(obs_test_logreg))) # accuracy: 98.23%, sensitivity: 98.59%, specificity:97.62%
+# misclassification error rate = 1-accuracy = 0.0177
+```
+
+### Logistic regression plus stepwise forward selection with AIC
+
+Based on the fitted stepwise forward logistic regression model, the variables 'texture_mean', 'perimeter_worst', 'concave_point_worst', and 'symmetry_worst' are the significant predictors (Wald test p=0.00007, p=0.0000001, p=0.00017, p=0.042 respectively).
+
+```{r logit_AIC_1, warning=FALSE}
+########### 
+## Stepwise forward selection
+########### 
+intercept_only <- glm(diagnosis ~ 1, family = binomial,  data = training_logreg) # the model that has only the intercept parameter
+intercept_summary <- summary(intercept_only)
+
+forward <- step(intercept_only, direction="forward", scope=formula(model_logistic_train), trace=0)
+forward_anova <- 
+  forward$anova # displays the forward selection procedure and the variables selected at each step
+forward$coefficients # displays the coefficients for the best subset model fitted
+```
+
+With the stepwise forward regression model, the misclassification error rate on the test set is 3.54%. The prediction accuracy of the stepwise forward regression on the test set is 96.46%.
+
+```{r logit_AIC_2, warning=FALSE}
+########### 
+## Fit logistic regression from stepwise forward
+########### 
+model_step_train <- glm(diagnosis ~
+                                    .-fractal_dimension_mean-concavity_se-perimeter_se-concavity_se-`concave points_se`-fractal_dimension_worst, 
+                            family = binomial,data=training_logreg)
+summary(model_step_train)
+
+# obtaining test error
+obs_test_step=testing_logreg[,1]
+pred.prob_test_step=predict(model_step_train, newdata=testing_logreg[,-1], type="response")
+pred.class_test_step=ifelse(pred.prob_test_step > 0.5, 1, 0)
+confusionMatrix(data=as.factor(pred.class_test_step),
+                reference=unlist(as.list(obs_test_step))) # accuracy: 96.46%, sensitivity: 97.18%, specificity:95.24%
+# misclassification error rate = 1-accuracy = 0.0354
+```
+
+### Random forest classification
+
+Based on the random forest classification, the variables 'texture_mean', 'perimeter_se', 'perimeter_worst', 'concave_point_worst', and 'symmetry_worst' are the significant predictors (Wald test p=0.0099, p=0.0099, p=0.0099, p=0.0099, p=0.049 respectively).
+
+```{r rf_1, warning=FALSE}
+########### 
+## Converting the original dataset to numeric
+########### 
+turn_to_numeric=function(a){    
+        if(is.numeric(a)==FALSE) a=as.numeric(a)
+}
+data3=apply(data2,2,turn_to_numeric)
+
+########### 
+## Test-train split (80% vs 20%)
+########### 
+set.seed(101)
+a=sample(1:568,455,replace=FALSE) # 0.70*568 ~ 455
+training_rf=data3[a,] 
+test_rf=data3[-a,]
+
+# Fitting the random forest on the training data
+model_rf=ranger(diagnosis ~ .-fractal_dimension_mean-concavity_se, data = clean_names(as.data.frame(training_rf)), importance = "permutation", classification=TRUE) 
+
+# Finding which predictors are significant
+importance_pvalues(model_rf, method = "altmann", formula = diagnosis ~ .-fractal_dimension_mean-concavity_se, data = clean_names(as.data.frame(training_rf)))
+```
+
+With the random forest classification, the misclassification error rate on the test set is 5.31%. The prediction accuracy for the random forest on the test set is 94.69%.
+
+```{r rf_2, warning=FALSE}
+# Predicting the responses in the test set and obtaining the misclassification
+# error rate
+pred_rf0=predict(model_rf, data=clean_names(as.data.frame(test_rf))[,-1], type="response")
+pred_rf=pred_rf0$predictions
+obs_test=test_rf[,1]
+err_rf=mean((obs_test - pred_rf)^2) 
+confusionMatrix(data=as.factor(pred_rf),reference=as.factor(obs_test)) # accuracy: 94.69%, sensitivity: 93.33%, spcificity:97.37%
+# misclassification error rate = 1-accuracy = 0.0531
+```
+
+### ROC analysis
+
+We plot the ROC curve and compute the area under the curve (AUC) for the three models to compare the prediction accuracy of the three classification methods. From the ROC curve, we see that the logistic regression model gives a curve closest to the top-left corner, indicating a better performance. The logistic regression model also has the highest AUC among the three models, suggesting it has the highest prediction accuracy.
+
+```{r roc, echo=FALSE, results='hide', fig.cap = "ROC analysis using logistic regression, logistic regression plus stepwise forward selection, and random forest for Breast Cancer (Wisconsin) Dataset."}
+### Plotting the ROC curves
+par(pty = "s")
+roc(obs_test_logreg$diagnosis, pred.prob_test_logreg, plot=TRUE, legacy.axes=TRUE, percent=TRUE, xlab="False Positive Percentage", ylab="True Postive Percentage", col="#377eb8", lwd=2, print.auc=TRUE, print.auc.y = 54)
+plot.roc(obs_test_step$diagnosis, pred.prob_test_step, percent=TRUE, col="#4daf4a", lwd=2, print.auc=TRUE, add=TRUE, print.auc.y=47)
+plot.roc(obs_test, pred_rf, percent=TRUE, col="#984EA3", lwd=, print.auc=TRUE, add=TRUE, print.auc.y=40)
+legend("bottomright", legend=c("Logisitic",
+                               "Logisitic + AIC",
+                               "Random Forest"), col=c("#377eb8", "#4daf4a", "#984EA3"),lwd=2)
+```
+
+## Conclusion
+
+Overall, we presented machine learning models that can be applied in breast cancer diagnosis to improve the accuracy and therefore assist early diagnosis of breast cancer. The logistic regression model with diagnosis as the outcome and the main effect of 9 features for each cell nucleus has the highest prediction accuracy and the lowest misclassification error rate on the test set among three models. The random forest classification has the lowest accuracy and highest classification error rate on the test set. Top 3 predictor variables for classification according to logistic regression model are 'texture_mean', 'concave_point_worst', and 'perimeter_worst'.
+
+## Future Work
+
+The Wisconsin dataset is small in size (568 samples), contains imbalanced data, and was collected in the early 90s. Same analysis could be performed on a larger and more recent dataset in order to better capture the cell features. In addition, unsupervised learning algorithm such as PCA and SVM could be used to first label and data and distributing them over training set and test set. Moreover, instead of limiting predictions to three algorithms, we could use more machine learning techniques such as K-nearest neighbor and Support Vector Machine to improve the performance.
+
+## References
+
+Dataset: Breast Cancer Wisconsin (Diagnostic) Data Set
+
+<https://archive.ics.uci.edu/ml/datasets/Breast+Cancer+Wisconsin+%28Diagnostic%29>
+
+Breast Cancer Dataset Analysis
+
+<https://www.kaggle.com/code/lbronchal/breast-cancer-dataset-analysis>
+
+Logistic Regression, LDA,QDA,KNN(beginner)
+
+<https://www.kaggle.com/code/asukatoyama/logistic-regression-lda-qda-knn-beginner/notebook>
+
+Receiver Operating Characteristic (ROC) Curve Analysis for Medical Diagnostic Test Evaluation
+
+<https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3755824/>
+
+\pagebreak
+
+## Code appendix
+
+```{r code_appendix, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
